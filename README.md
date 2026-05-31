@@ -1,24 +1,24 @@
 # BLife Concierge Packages - Home Assistant Integration
 
-A custom Home Assistant integration for tracking packages at your building's concierge desk.
+A custom Home Assistant integration for tracking packages at your building's concierge desk. Uses the Spike Global platform API that underpins the B.Life mobile app.
 
 ## Features
 
-- **Configuration UI**: Easy setup through Home Assistant's UI with username, password, and device ID
+- **Simple setup**: Username and password only — no device ID required
 - **Async-first**: Built with modern async patterns using DataUpdateCoordinator
-- **Package Count Sensor**: `{firstname}_packages_ready_to_collect` - Shows count of packages waiting for pickup
-- **Package List Sensor**: `{firstname}_packages_list` - Full list of all packages with codes and details
-- **Auto-refresh**: Polls for updates every 5 minutes (configurable)
-- **Reauth Support**: Handles credential expiration gracefully
+- **Package sensor**: Count of pending packages with full details as attributes
+- **Locker details**: Access code and locker description fetched for each pending package
+- **Auto-refresh**: Polls every 5 minutes
+- **Reauth support**: Handles token expiry gracefully
 
 ## Installation
 
 ### HACS (Recommended)
 
 1. Open HACS in your Home Assistant
-2. Click on "Integrations"
-3. Click the three dots menu → "Custom repositories"
-4. Add this repository URL and select "Integration" as the category
+2. Click on **Integrations**
+3. Click the three dots menu → **Custom repositories**
+4. Add this repository URL and select **Integration** as the category
 5. Install "BLife Concierge Packages"
 6. Restart Home Assistant
 
@@ -27,54 +27,46 @@ A custom Home Assistant integration for tracking packages at your building's con
 1. Copy the `custom_components/blife_packages` folder to your Home Assistant's `custom_components` directory
 2. Restart Home Assistant
 
-## Secrets – what not to commit
-
-- **BLife credentials** (username, password, device ID) are only entered in Home Assistant’s UI and stored in HA’s config – they are never in this repo.
-- **Deploy script**: Do not hardcode your Home Assistant host or SSH user. Use environment variables:
-  - `export HA_HOST=192.168.0.117` (or `homeassistant.local`)
-  - `export HA_USER=root`
-  - `export HA_CONFIG_PATH=/config`
-  - Then run `./deploy.sh`
-- Optional: create a `deploy.local.sh` that sets these and run that instead; `deploy.local.sh` is in `.gitignore` and will not be committed.
-
 ## Configuration
 
 1. Go to **Settings** → **Devices & Services**
 2. Click **+ Add Integration**
 3. Search for "BLife Concierge Packages"
 4. Enter your credentials:
-   - **Username**: Your BLife account email/username
-   - **Password**: Your BLife account password
-   - **Device ID**: Your building's unique device identifier
+   - **Username**: Your B.Life account email
+   - **Password**: Your B.Life account password
 
 ## Sensors
 
-After configuration, the integration creates the following sensors:
-
 ### Packages Ready to Collect
+
 - **Entity ID**: `sensor.{firstname}_packages_ready_to_collect`
-- **State**: Number of packages ready for pickup
+- **State**: Count of pending (uncollected) packages
 - **Attributes**:
-  - `packages`: List of ready packages with details
-
-### Packages List
-- **Entity ID**: `sensor.{firstname}_packages_list`
-- **State**: Total number of packages
-- **Attributes**:
-  - `packages`: Full list of all packages
-  - `ready_count`: Number ready for pickup
-  - `collected_count`: Number already collected
-
-## Package Attributes
+  - `packages`: List of pending packages
 
 Each package in the list includes:
-- `package_id`: Unique package identifier
-- `code`: Pickup code for the concierge
-- `description`: Package description
-- `arrived_at`: Arrival timestamp
-- `status`: Current status (ready/collected)
-- `sender`: Package sender
-- `carrier`: Delivery carrier
+
+| Field | Description |
+|---|---|
+| `package_id` | Unique identifier |
+| `reference` | Numeric pickup reference |
+| `status` | `pending` or `collected` |
+| `access_code` | PIN/code to open the locker |
+| `locker_description` | Locker location (e.g. `Red 4`) |
+| `tracking_number` | Courier tracking number (if set) |
+| `created_date` | Arrival timestamp (ISO 8601) |
+| `collected_date` | Collection timestamp (ISO 8601, null if pending) |
+
+## Secrets – what not to commit
+
+- Credentials are entered in Home Assistant's UI and stored in HA config — never in this repo.
+- **Deploy script**: Do not hardcode your Home Assistant host or SSH user. Use environment variables:
+  - `export HA_HOST=192.168.0.117` (or `homeassistant.local`)
+  - `export HA_USER=root`
+  - `export HA_CONFIG_PATH=/config`
+  - Then run `./deploy.sh`
+- Optional: create a `deploy.local.sh` that sets these and run that instead; `deploy.local.sh` is gitignored.
 
 ## Example Automations
 
@@ -85,59 +77,54 @@ automation:
   - alias: "New Package Notification"
     trigger:
       - platform: state
-        entity_id: sensor.john_packages_ready_to_collect
+        entity_id: sensor.mihail_packages_ready_to_collect
     condition:
       - condition: template
         value_template: "{{ trigger.to_state.state | int > trigger.from_state.state | int }}"
     action:
       - service: notify.mobile_app
         data:
-          title: "📦 New Package!"
-          message: "You have {{ states('sensor.john_packages_ready_to_collect') }} package(s) ready for pickup"
+          title: "New Package!"
+          message: >
+            {{ trigger.to_state.attributes.packages | length }} package(s) waiting.
+            {% set p = trigger.to_state.attributes.packages[0] %}
+            Locker: {{ p.locker_description }}. Code: {{ p.access_code }}.
 ```
 
-### Daily package summary
+### Daily package reminder
 
 ```yaml
 automation:
-  - alias: "Daily Package Summary"
+  - alias: "Daily Package Reminder"
     trigger:
       - platform: time
         at: "18:00:00"
     condition:
       - condition: numeric_state
-        entity_id: sensor.john_packages_ready_to_collect
+        entity_id: sensor.mihail_packages_ready_to_collect
         above: 0
     action:
       - service: notify.mobile_app
         data:
-          title: "📬 Package Reminder"
-          message: "Don't forget! You have {{ states('sensor.john_packages_ready_to_collect') }} package(s) waiting at the concierge."
+          title: "Package Reminder"
+          message: >
+            {{ states('sensor.mihail_packages_ready_to_collect') }} package(s) waiting.
+            {% for p in state_attr('sensor.mihail_packages_ready_to_collect', 'packages') %}
+            Ref {{ p.reference }} — {{ p.locker_description }}, code {{ p.access_code }}.
+            {% endfor %}
 ```
 
-## API Integration
+## API
 
-The integration currently uses stub data for development. To connect to your actual BLife API:
+Authenticates against `https://auth.spikeglobal.io`, then queries the building's Spike community API via GraphQL (`POST /query`). Locker details fetched via REST (`GET /mobile/v1/delivery/{id}`) for pending packages only.
 
-1. Update `coordinator.py`:
-   - Replace the stub `_fetch_packages_data()` method with actual API calls
-   - Implement proper authentication flow
-
-2. Update `config_flow.py`:
-   - Replace the stub `validate_input()` function with actual API validation
-
-3. Update `const.py`:
-   - Set `API_BASE_URL` to your actual API endpoint
-
-## Development
-
-### File Structure
+## File Structure
 
 ```
 custom_components/blife_packages/
 ├── __init__.py          # Integration setup
 ├── config_flow.py       # Configuration UI flow
-├── const.py             # Constants and configuration
+├── const.py             # Constants
 ├── coordinator.py       # Data update coordinator
 ├── manifest.json        # Integration metadata
 ├── sensor.py            # Sensor entities
@@ -146,7 +133,7 @@ custom_components/blife_packages/
     └── en.json          # English translations
 ```
 
-### Requirements
+## Requirements
 
 - Home Assistant 2024.1.0 or later
 - Python 3.11+
@@ -154,4 +141,3 @@ custom_components/blife_packages/
 ## License
 
 MIT License
-
