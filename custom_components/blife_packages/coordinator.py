@@ -16,13 +16,29 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
-    API_BASE_URL,
-    CONF_DEVICE_ID,
+    AUTH_BASE_URL,
+    AUTH_LOGIN_PATH,
+    CONF_API_URL,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+PACKAGES_QUERY = """
+query {
+  packages(first: 50) {
+    nodes {
+      id
+      reference
+      status
+      createdDate
+      collectedDate
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+""".strip()
 
 
 @dataclass
@@ -30,32 +46,26 @@ class Package:
     """Representation of a package."""
 
     package_id: str
-    ref_number: str  # The code used to collect the package
-    is_collection_required: bool
-    latest_action: str
+    reference: str
+    status: str
     created_date: datetime | None = None
-    latest_action_date: datetime | None = None
-    addressed_to_unit: str | None = None
-    sender_name: str | None = None
-    courier_name: str | None = None
-    internal_number: str | None = None
+    collected_date: datetime | None = None
+    access_code: str | None = None
+    locker_description: str | None = None
+    tracking_number: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert package to dictionary for attributes."""
         return {
             "package_id": self.package_id,
-            "ref_number": self.ref_number,
-            "code": self.ref_number,  # Alias for compatibility
-            "is_collection_required": self.is_collection_required,
-            "latest_action": self.latest_action,
+            "reference": self.reference,
+            "code": self.reference,
+            "status": self.status,
             "created_date": self.created_date.isoformat() if self.created_date else None,
-            "latest_action_date": (
-                self.latest_action_date.isoformat() if self.latest_action_date else None
-            ),
-            "addressed_to_unit": self.addressed_to_unit,
-            "sender_name": self.sender_name,
-            "courier_name": self.courier_name,
-            "internal_number": self.internal_number,
+            "collected_date": self.collected_date.isoformat() if self.collected_date else None,
+            "access_code": self.access_code,
+            "locker_description": self.locker_description,
+            "tracking_number": self.tracking_number,
         }
 
 
@@ -69,11 +79,8 @@ class BLifePackagesData:
 
     @property
     def packages_ready_to_collect(self) -> int:
-        """Return count of packages ready to collect."""
-        return len([
-            p for p in self.packages
-            if p.latest_action != "collected" and p.created_date is not None
-        ])
+        """Return count of packages pending collection."""
+        return len([p for p in self.packages if p.status == "pending"])
 
     @property
     def packages_list(self) -> list[dict[str, Any]]:
@@ -101,154 +108,202 @@ class BLifePackagesCoordinator(DataUpdateCoordinator[BLifePackagesData]):
         )
         self.username = config_entry.data[CONF_USERNAME]
         self.password = config_entry.data[CONF_PASSWORD]
-        self.device_id = config_entry.data[CONF_DEVICE_ID]
         self.firstname = config_entry.data.get("firstname", "User")
-        self._token = config_entry.data.get("token")
+        self._token: str | None = config_entry.data.get("token")
+        self._token_type: str = config_entry.data.get("token_type", "Bearer")
+        self._api_url: str | None = config_entry.data.get(CONF_API_URL)
 
     async def _async_update_data(self) -> BLifePackagesData:
         """Fetch data from API."""
         try:
             return await self._fetch_packages_data()
+        except ConfigEntryAuthFailed:
+            raise
         except Exception as err:
             raise UpdateFailed(f"Error fetching packages data: {err}") from err
 
     async def _fetch_packages_data(self) -> BLifePackagesData:
-        """Fetch packages data from the BLife API."""
-        # Re-authenticate if we don't have a token
-        if not self._token:
+        """Fetch packages via GraphQL."""
+        if not self._token or not self._api_url:
             await self._authenticate()
 
+        url = f"{self._api_url}/query"
         headers = {
-            "Host": "api-community.ballymorelife.com",
-            "Accept": "application/json, text/plain, */*",
-            "Authorization": f"Bearer {self._token}",
-            "Sec-Fetch-Site": "cross-site",
-            "Accept-Language": "en-GB,en;q=0.9",
-            "Sec-Fetch-Mode": "cors",
-            "App-Path": "typeID:my-deliveries, appID:my-deliveries",
-            "Origin": "app://localhost",
-            "DeviceID": self.device_id,
-            "Authorization-Type": "Bearer",
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
-            "Sec-Fetch-Dest": "empty",
+            "Authorization": f"{self._token_type} {self._token}",
+            "x-spike-origin": "mobile",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
         }
-
-        url = f"{API_BASE_URL}/my-deliveries/data-query/packages?$top=25&$skip=0&$orderBy=refNumber%20desc"
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers) as response:
-                    if response.status == 401:
-                        # Token expired, try to re-authenticate once
-                        _LOGGER.warning("Token expired, re-authenticating...")
-                        await self._authenticate()
-                        headers["Authorization"] = f"Bearer {self._token}"
-                        async with session.get(url, headers=headers) as retry_response:
-                            if retry_response.status == 401:
-                                raise ConfigEntryAuthFailed(
-                                    "Authentication failed. Please reconfigure the integration."
-                                )
-                            if retry_response.status != 200:
-                                raise UpdateFailed(
-                                    f"API returned {retry_response.status}"
-                                )
-                            data = await retry_response.json()
-                    elif response.status != 200:
-                        raise UpdateFailed(f"API returned {response.status}: {await response.text()}")
-                    else:
-                        data = await response.json()
-
-                    return self._parse_packages_response(data)
+                data = await self._graphql_request(session, url, headers)
+                if data is None:
+                    _LOGGER.warning("Token expired, re-authenticating...")
+                    await self._authenticate()
+                    headers["Authorization"] = f"{self._token_type} {self._token}"
+                    data = await self._graphql_request(session, url, headers)
+                    if data is None:
+                        raise ConfigEntryAuthFailed(
+                            "Authentication failed. Please reconfigure the integration."
+                        )
+                packages = self._parse_packages_response(data)
+                await self._enrich_pending_packages(session, headers, packages)
+                return packages
         except ConfigEntryAuthFailed:
             raise
         except aiohttp.ClientError as err:
             raise UpdateFailed(f"Connection error: {err}") from err
 
-    async def _authenticate(self) -> None:
-        """Authenticate and get a new token."""
-        headers = {
-            "Host": "api-community.ballymorelife.com",
-            "App-Path": "typeID:sign-in, appID:sign-in",
-            "Accept": "application/json, text/plain, */*",
-            "Sec-Fetch-Site": "cross-site",
-            "Accept-Language": "en-GB,en;q=0.9",
-            "Sec-Fetch-Mode": "cors",
-            "Content-Type": "application/json;charset=utf-8",
-            "Origin": "app://localhost",
-            "DeviceID": self.device_id,
-            "Authorization-Type": "Bearer",
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
-            "Sec-Fetch-Dest": "empty",
-        }
+    async def _graphql_request(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        headers: dict,
+    ) -> dict | None:
+        """Make GraphQL request, return None on 401."""
+        async with session.post(
+            url,
+            headers=headers,
+            json={"query": PACKAGES_QUERY},
+        ) as response:
+            if response.status == 401:
+                return None
+            if response.status != 200:
+                body = await response.text()
+                raise UpdateFailed(f"GraphQL endpoint returned {response.status}: {body}")
+            body = await response.json(content_type=None)
+            if errors := body.get("errors"):
+                raise UpdateFailed(f"GraphQL errors: {errors}")
+            return body.get("data") or {}
 
-        login_data = {
-            "UserName": self.username,
-            "Password": self.password,
-            "RememberMe": True,
-            "device": {
-                "uuid": self.device_id,
-                "model": "HomeAssistant",
-                "version": "1.0",
-                "manufacturer": "HomeAssistant",
-                "serial": "unknown",
-                "platform": "homeassistant",
-                "appPackageId": "com.homeassistant.blife",
-                "appVersion": "1.0.0",
-                "platformTag": 1,
-                "screenLock": True,
-            },
+    async def _authenticate(self) -> None:
+        """Authenticate against Spike auth service."""
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "x-spike-origin": "mobile",
         }
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                f"{API_BASE_URL}/account/login",
+                f"{AUTH_BASE_URL}{AUTH_LOGIN_PATH}",
                 headers=headers,
-                json=login_data,
+                json={"email": self.username, "password": self.password},
             ) as response:
+                body = await response.json(content_type=None)
+
                 if response.status == 401:
                     raise ConfigEntryAuthFailed("Invalid credentials")
                 if response.status != 200:
                     raise UpdateFailed(f"Login failed with status {response.status}")
+                if isinstance(body, dict) and not body.get("success", True):
+                    errors = body.get("errors") or []
+                    raise ConfigEntryAuthFailed(errors[0] if errors else "Login rejected")
 
-                token = response.headers.get("U-Set-Token")
+                value = (body.get("value") or {}) if isinstance(body, dict) else {}
+                token = value.get("token")
                 if not token:
-                    raise UpdateFailed("No token received from login")
-                
+                    raise UpdateFailed(f"No token in login response: {list(body.keys())}")
+
                 self._token = token
-                _LOGGER.debug("Successfully authenticated and obtained new token")
+                self._token_type = value.get("type") or "Bearer"
+
+                if not self._api_url:
+                    await self._fetch_api_url()
+
+    async def _fetch_api_url(self) -> None:
+        """Fetch community apiUrl from user-access endpoint."""
+        headers = {
+            "Authorization": f"{self._token_type} {self._token}",
+            "x-spike-origin": "mobile",
+            "Accept": "application/json",
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{AUTH_BASE_URL}/api/user-access",
+                headers=headers,
+            ) as response:
+                body = await response.json(content_type=None)
+                if response.status != 200:
+                    raise UpdateFailed(f"user-access returned {response.status}")
+
+                clients = (body.get("value") or {}).get("clients") or []
+                if not clients:
+                    raise UpdateFailed("No clients in user-access response")
+
+                raw_url = clients[0].get("apiUrl", "")
+                if not raw_url:
+                    raise UpdateFailed("No apiUrl in client entry")
+
+                if raw_url.startswith("http"):
+                    self._api_url = raw_url
+                elif "localhost" in raw_url:
+                    self._api_url = f"https://{raw_url}"
+                else:
+                    self._api_url = f"https://api-{raw_url}"
+
+                _LOGGER.debug("api_url: %s", self._api_url)
+
+    async def _enrich_pending_packages(
+        self,
+        session: aiohttp.ClientSession,
+        headers: dict,
+        packages_data: BLifePackagesData,
+    ) -> None:
+        """Fetch access code and locker details for pending packages via REST."""
+        for package in packages_data.packages:
+            if package.status != "pending":
+                continue
+            try:
+                detail_url = f"{self._api_url}/mobile/v1/delivery/{package.package_id}"
+                async with session.get(detail_url, headers=headers) as resp:
+                    if resp.status != 200:
+                        _LOGGER.debug("Detail fetch returned %s for package %s", resp.status, package.package_id)
+                        continue
+                    detail = (await resp.json(content_type=None)).get("value") or {}
+                    package.access_code = detail.get("accessCode")
+                    for cfv in detail.get("customFieldValues") or []:
+                        field_name = cfv.get("fieldName") or ""
+                        cid = cfv.get("customFieldId", "")
+                        val = cfv.get("value")
+                        if cid == "e1c552a9-3929-48da-8c40-49b460c67cc6" or "locker" in field_name.lower():
+                            package.locker_description = str(val) if val is not None else None
+                        elif cid == "40306110-2b9c-4b30-8d25-7243b293096d" or "tracking" in field_name.lower():
+                            package.tracking_number = str(val) if val is not None else None
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Failed to enrich package %s: %s", package.package_id, err)
 
     def _parse_packages_response(self, data: dict[str, Any]) -> BLifePackagesData:
-        """Parse the API response into BLifePackagesData."""
+        """Parse GraphQL response into BLifePackagesData."""
+        nodes = (data.get("packages") or {}).get("nodes") or []
         packages = []
-        package_list = data.get("list", [])
 
-        for pkg_data in package_list:
-            # Parse dates from timestamp (milliseconds)
+        for item in nodes:
             created_date = None
-            if created_ms := pkg_data.get("createdDateModel", {}).get("ms"):
-                created_date = datetime.fromtimestamp(created_ms / 1000)
+            if cd := item.get("createdDate"):
+                try:
+                    created_date = datetime.fromisoformat(str(cd).replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    pass
 
-            latest_action_date = None
-            if action_ms := pkg_data.get("latestActionDateModel", {}).get("ms"):
-                latest_action_date = datetime.fromtimestamp(action_ms / 1000)
+            collected_date = None
+            if cod := item.get("collectedDate"):
+                try:
+                    collected_date = datetime.fromisoformat(str(cod).replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    pass
 
-            package = Package(
-                package_id=pkg_data.get("id", ""),
-                ref_number=pkg_data.get("refNumber", ""),
-                is_collection_required=pkg_data.get("isCollectionRequired", False),
-                latest_action=pkg_data.get("latestAction", "unknown"),
+            packages.append(Package(
+                package_id=str(item.get("id", "")),
+                reference=str(item.get("reference", "")),
+                status=str(item.get("status") or "unknown"),
                 created_date=created_date,
-                latest_action_date=latest_action_date,
-                addressed_to_unit=pkg_data.get("addressedToUnitNumber"),
-                sender_name=pkg_data.get("senderName"),
-                courier_name=pkg_data.get("courierName"),
-                internal_number=pkg_data.get("internalNumber"),
-            )
-            packages.append(package)
+                collected_date=collected_date,
+            ))
 
         return BLifePackagesData(
             firstname=self.firstname,
             packages=packages,
             last_updated=datetime.now(),
         )
-

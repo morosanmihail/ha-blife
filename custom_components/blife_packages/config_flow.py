@@ -13,7 +13,7 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
-from .const import API_BASE_URL, CONF_DEVICE_ID, DOMAIN
+from .const import AUTH_BASE_URL, AUTH_LOGIN_PATH, CONF_API_URL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -21,7 +21,6 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_USERNAME): str,
         vol.Required(CONF_PASSWORD): str,
-        vol.Required(CONF_DEVICE_ID): str,
     }
 )
 
@@ -35,86 +34,63 @@ class CannotConnect(HomeAssistantError):
 
 
 async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]:
-    """Validate the user input allows us to connect.
-
-    Data has the keys from STEP_USER_DATA_SCHEMA with values provided by the user.
-    """
-    username = data[CONF_USERNAME]
-    password = data[CONF_PASSWORD]
-    device_id = data[CONF_DEVICE_ID]
-
-    _LOGGER.debug(
-        "Validating credentials for user %s with device %s", username, device_id
-    )
-
+    """Validate credentials and return token + api_url."""
     headers = {
-        "Host": "api-community.ballymorelife.com",
-        "App-Path": "typeID:sign-in, appID:sign-in",
-        "Accept": "application/json, text/plain, */*",
-        "Sec-Fetch-Site": "cross-site",
-        "Accept-Language": "en-GB,en;q=0.9",
-        "Sec-Fetch-Mode": "cors",
-        "Content-Type": "application/json;charset=utf-8",
-        "Origin": "app://localhost",
-        "DeviceID": device_id,
-        "Authorization-Type": "Bearer",
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
-        "Sec-Fetch-Dest": "empty",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "x-spike-origin": "mobile",
     }
 
     login_data = {
-        "UserName": username,
-        "Password": password,
-        "RememberMe": True,
-        "device": {
-            "uuid": device_id,
-            "model": "HomeAssistant",
-            "version": "1.0",
-            "manufacturer": "HomeAssistant",
-            "serial": "unknown",
-            "platform": "homeassistant",
-            "appPackageId": "com.homeassistant.blife",
-            "appVersion": "1.0.0",
-            "platformTag": 1,
-            "screenLock": True,
-        },
+        "email": data[CONF_USERNAME],
+        "password": data[CONF_PASSWORD],
     }
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                f"{API_BASE_URL}/account/login",
+                f"{AUTH_BASE_URL}{AUTH_LOGIN_PATH}",
                 headers=headers,
                 json=login_data,
             ) as response:
                 if response.status == 401:
                     raise InvalidAuth
+
                 if response.status != 200:
-                    _LOGGER.error(
-                        "Login failed with status %d: %s",
-                        response.status,
-                        await response.text(),
-                    )
+                    _LOGGER.error("Login failed with status %d", response.status)
                     raise CannotConnect
 
-                result = await response.json()
-                
-                # Extract token from U-Set-Token header
-                token = response.headers.get("U-Set-Token")
+                body = await response.json(content_type=None)
+
+                if isinstance(body, dict) and not body.get("success", True):
+                    errors = body.get("errors") or []
+                    error_msg = errors[0] if errors else "Login rejected by server"
+                    _LOGGER.error("Login failed: %s", error_msg)
+                    raise InvalidAuth
+
+                # Response: {"value": {"token": "...", "type": "Bearer"}}
+                token = None
+                token_type = "Bearer"
+                firstname = ""
+
+                if isinstance(body, dict):
+                    value = body.get("value") or {}
+                    if isinstance(value, dict):
+                        token = value.get("token")
+                        token_type = value.get("type") or "Bearer"
+
                 if not token:
-                    _LOGGER.warning("No U-Set-Token header in response")
-                
-                # Extract firstname from user details
-                user_details = result.get("user", {}).get("details", {})
-                firstname = user_details.get("firstName", "").strip()
-                if not firstname:
-                    # Fallback to extracting from email
-                    firstname = username.split("@")[0].split(".")[0].capitalize()
+                    _LOGGER.warning("No token in login response. Keys: %s", list(body.keys()) if isinstance(body, dict) else type(body))
+                    raise CannotConnect
+
+                firstname = data[CONF_USERNAME].split("@")[0].split(".")[0].capitalize()
 
                 return {
                     "title": f"BLife - {firstname}",
                     "firstname": firstname,
-                    "token": token,  # Store token for coordinator
+                    "token": token,
+                    "token_type": token_type,
+                    CONF_API_URL: None,
                 }
     except aiohttp.ClientError as err:
         _LOGGER.error("Connection error during login: %s", err)
@@ -133,10 +109,6 @@ class BLifePackagesConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            # Check if this device is already configured
-            await self.async_set_unique_id(user_input[CONF_DEVICE_ID])
-            self._abort_if_unique_id_configured()
-
             try:
                 info = await validate_input(self.hass, user_input)
             except CannotConnect:
@@ -147,11 +119,15 @@ class BLifePackagesConfigFlow(ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
             else:
-                # Store firstname and token in the data
-                user_input["firstname"] = info["firstname"]
-                if "token" in info:
-                    user_input["token"] = info["token"]
-                return self.async_create_entry(title=info["title"], data=user_input)
+                entry_data = {
+                    CONF_USERNAME: user_input[CONF_USERNAME],
+                    CONF_PASSWORD: user_input[CONF_PASSWORD],
+                    "firstname": info["firstname"],
+                    "token": info["token"],
+                    "token_type": info["token_type"],
+                    CONF_API_URL: info[CONF_API_URL],
+                }
+                return self.async_create_entry(title=info["title"], data=entry_data)
 
         return self.async_show_form(
             step_id="user",
@@ -174,14 +150,7 @@ class BLifePackagesConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             reauth_entry = self._get_reauth_entry()
             try:
-                info = await validate_input(
-                    self.hass,
-                    {
-                        CONF_USERNAME: user_input[CONF_USERNAME],
-                        CONF_PASSWORD: user_input[CONF_PASSWORD],
-                        CONF_DEVICE_ID: reauth_entry.data[CONF_DEVICE_ID],
-                    },
-                )
+                info = await validate_input(self.hass, user_input)
             except CannotConnect:
                 errors["base"] = "cannot_connect"
             except InvalidAuth:
@@ -197,7 +166,9 @@ class BLifePackagesConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_USERNAME: user_input[CONF_USERNAME],
                         CONF_PASSWORD: user_input[CONF_PASSWORD],
                         "firstname": info["firstname"],
-                        "token": info.get("token"),
+                        "token": info["token"],
+                        "token_type": info["token_type"],
+                        CONF_API_URL: info[CONF_API_URL],
                     },
                 )
 
@@ -211,4 +182,3 @@ class BLifePackagesConfigFlow(ConfigFlow, domain=DOMAIN):
             ),
             errors=errors,
         )
-

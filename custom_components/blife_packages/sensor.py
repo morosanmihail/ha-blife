@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -19,10 +18,9 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
     ATTR_PACKAGES,
-    CONF_DEVICE_ID,
+    CONF_API_URL,
     DOMAIN,
     SENSOR_PACKAGES_COUNT,
-    SENSOR_LAST_PACKAGE_REF,
 )
 from .coordinator import BLifePackagesCoordinator, BLifePackagesData
 
@@ -39,30 +37,6 @@ class BLifePackagesSensorEntityDescription(SensorEntityDescription):
 
 def get_sensor_descriptions(firstname: str) -> list[BLifePackagesSensorEntityDescription]:
     """Generate sensor descriptions with dynamic naming based on firstname."""
-
-    def get_last_package_ref(data: BLifePackagesData) -> str | None:
-        """Get the ref number of the most recent uncollected package."""
-        uncollected = [
-            p for p in data.packages
-            if p.latest_action != "collected" and p.created_date is not None
-        ]
-        if not uncollected:
-            return None
-        # Sort by created_date descending (most recent first)
-        uncollected.sort(key=lambda p: p.created_date or datetime.min, reverse=True)
-        return uncollected[0].ref_number
-
-    def get_last_package_attrs(data: BLifePackagesData) -> dict[str, Any]:
-        """Get attributes for the last package sensor."""
-        uncollected = [
-            p for p in data.packages
-            if p.latest_action != "collected" and p.created_date is not None
-        ]
-        if not uncollected:
-            return {"last_package": None}
-        uncollected.sort(key=lambda p: p.created_date or datetime.min, reverse=True)
-        return {"last_package": uncollected[0].to_dict()}
-
     return [
         BLifePackagesSensorEntityDescription(
             key=SENSOR_PACKAGES_COUNT,
@@ -75,17 +49,9 @@ def get_sensor_descriptions(firstname: str) -> list[BLifePackagesSensorEntityDes
                 ATTR_PACKAGES: [
                     p.to_dict()
                     for p in data.packages
-                    if p.latest_action != "collected" and p.created_date is not None
+                    if p.status == "pending"
                 ],
             },
-        ),
-        BLifePackagesSensorEntityDescription(
-            key=SENSOR_LAST_PACKAGE_REF,
-            translation_key="last_package_ref_number",
-            name=f"{firstname} Last Package Ref",
-            icon="mdi:package-variant",
-            value_fn=get_last_package_ref,
-            extra_state_attributes_fn=get_last_package_attrs,
         ),
     ]
 
@@ -99,15 +65,13 @@ async def async_setup_entry(
     coordinator: BLifePackagesCoordinator = hass.data[DOMAIN][entry.entry_id]
 
     firstname = entry.data.get("firstname", "User")
-    sensor_descriptions = get_sensor_descriptions(firstname)
-
     async_add_entities(
         BLifePackagesSensor(
             coordinator=coordinator,
             description=description,
             entry=entry,
         )
-        for description in sensor_descriptions
+        for description in get_sensor_descriptions(firstname)
     )
 
 
@@ -128,11 +92,11 @@ class BLifePackagesSensor(
         """Initialize the sensor."""
         super().__init__(coordinator)
         self.entity_description = description
-        self._attr_unique_id = f"{entry.data[CONF_DEVICE_ID]}_{description.key}"
-        
-        # Create device info for grouping entities
+        unique_key = entry.data.get(CONF_API_URL) or entry.entry_id
+        self._attr_unique_id = f"{unique_key}_{description.key}"
+
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry.data[CONF_DEVICE_ID])},
+            identifiers={(DOMAIN, unique_key)},
             name=f"BLife Concierge ({entry.data.get('firstname', 'User')})",
             manufacturer="BLife",
             model="Concierge Packages",
@@ -155,4 +119,3 @@ class BLifePackagesSensor(
     def available(self) -> bool:
         """Return if entity is available."""
         return self.coordinator.last_update_success and self.coordinator.data is not None
-

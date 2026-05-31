@@ -3,16 +3,14 @@
     "step": {
       "user": {
         "title": "BLife Concierge Packages",
-        "description": "Enter your BLife credentials and device ID to connect your concierge packages service.",
+        "description": "Enter your BLife credentials to connect your concierge packages service.",
         "data": {
           "username": "Username",
-          "password": "Password",
-          "device_id": "Device ID"
+          "password": "Password"
         },
         "data_description": {
           "username": "Your BLife account email or username",
-          "password": "Your BLife account password",
-          "device_id": "The unique device identifier for your building"
+          "password": "Your BLife account password"
         }
       },
       "reauth_confirm": {
@@ -38,9 +36,6 @@
     "sensor": {
       "packages_ready_to_collect": {
         "name": "Packages Ready to Collect"
-      },
-      "packages_list": {
-        "name": "Packages List"
       }
     }
   }
