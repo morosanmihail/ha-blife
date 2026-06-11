@@ -2,6 +2,8 @@
 
 A custom Home Assistant integration for tracking packages at your building's concierge desk. Uses the Spike Global platform API that underpins the B.Life mobile app.
 
+<img width="465" height="112" alt="Screenshot_20260611_134324" src="https://github.com/user-attachments/assets/2509fbc2-e534-429e-9cef-96b1b0ab95f5" />
+
 ## Features
 
 - **Simple setup**: Username and password only — no device ID required
