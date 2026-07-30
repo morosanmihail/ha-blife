@@ -26,8 +26,8 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 PACKAGES_QUERY = """
-query {
-  packages(first: 50) {
+query($after: String) {
+  packages(first: 50, after: $after) {
     nodes {
       id
       reference
@@ -147,12 +147,35 @@ class BLifePackagesCoordinator(DataUpdateCoordinator[BLifePackagesData]):
                         raise ConfigEntryAuthFailed(
                             "Authentication failed. Please reconfigure the integration."
                         )
-                packages = self._parse_packages_response(data)
+
+                nodes = list((data.get("packages") or {}).get("nodes") or [])
+                page_info = (data.get("packages") or {}).get("pageInfo") or {}
+                page = 1
+                while page_info.get("hasNextPage"):
+                    page += 1
+                    cursor = page_info.get("endCursor")
+                    data = await self._graphql_request(session, url, headers, after=cursor)
+                    if data is None:
+                        raise ConfigEntryAuthFailed(
+                            "Authentication failed. Please reconfigure the integration."
+                        )
+                    nodes.extend((data.get("packages") or {}).get("nodes") or [])
+                    page_info = (data.get("packages") or {}).get("pageInfo") or {}
+
+                packages = self._parse_packages_response({"packages": {"nodes": nodes}})
+                _LOGGER.info(
+                    "Fetched %d package(s) across %d page(s) from %s (%d pending)",
+                    len(packages.packages),
+                    page,
+                    url,
+                    packages.packages_ready_to_collect,
+                )
                 await self._enrich_pending_packages(session, headers, packages)
                 return packages
         except ConfigEntryAuthFailed:
             raise
         except aiohttp.ClientError as err:
+            _LOGGER.info("GraphQL request to %s failed: %s", url, err)
             raise UpdateFailed(f"Connection error: {err}") from err
 
     async def _graphql_request(
@@ -160,13 +183,16 @@ class BLifePackagesCoordinator(DataUpdateCoordinator[BLifePackagesData]):
         session: aiohttp.ClientSession,
         url: str,
         headers: dict,
+        after: str | None = None,
     ) -> dict | None:
         """Make GraphQL request, return None on 401."""
+        _LOGGER.info("Calling GraphQL endpoint %s (after=%s)", url, after)
         async with session.post(
             url,
             headers=headers,
-            json={"query": PACKAGES_QUERY},
+            json={"query": PACKAGES_QUERY, "variables": {"after": after}},
         ) as response:
+            _LOGGER.info("GraphQL endpoint %s responded with status %d", url, response.status)
             if response.status == 401:
                 return None
             if response.status != 200:
@@ -174,6 +200,7 @@ class BLifePackagesCoordinator(DataUpdateCoordinator[BLifePackagesData]):
                 raise UpdateFailed(f"GraphQL endpoint returned {response.status}: {body}")
             body = await response.json(content_type=None)
             if errors := body.get("errors"):
+                _LOGGER.info("GraphQL endpoint %s returned errors: %s", url, errors)
                 raise UpdateFailed(f"GraphQL errors: {errors}")
             return body.get("data") or {}
 
@@ -185,13 +212,16 @@ class BLifePackagesCoordinator(DataUpdateCoordinator[BLifePackagesData]):
             "x-spike-origin": "mobile",
         }
 
+        login_url = f"{AUTH_BASE_URL}{AUTH_LOGIN_PATH}"
+        _LOGGER.info("Authenticating against %s", login_url)
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                f"{AUTH_BASE_URL}{AUTH_LOGIN_PATH}",
+                login_url,
                 headers=headers,
                 json={"email": self.username, "password": self.password},
             ) as response:
                 body = await response.json(content_type=None)
+                _LOGGER.info("Authentication call to %s responded with status %d", login_url, response.status)
 
                 if response.status == 401:
                     raise ConfigEntryAuthFailed("Invalid credentials")
@@ -208,6 +238,7 @@ class BLifePackagesCoordinator(DataUpdateCoordinator[BLifePackagesData]):
 
                 self._token = token
                 self._token_type = value.get("type") or "Bearer"
+                _LOGGER.info("Authentication succeeded, token type %s", self._token_type)
 
                 if not self._api_url:
                     await self._fetch_api_url()
@@ -219,12 +250,15 @@ class BLifePackagesCoordinator(DataUpdateCoordinator[BLifePackagesData]):
             "x-spike-origin": "mobile",
             "Accept": "application/json",
         }
+        user_access_url = f"{AUTH_BASE_URL}/api/user-access"
+        _LOGGER.info("Calling %s", user_access_url)
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                f"{AUTH_BASE_URL}/api/user-access",
+                user_access_url,
                 headers=headers,
             ) as response:
                 body = await response.json(content_type=None)
+                _LOGGER.info("%s responded with status %d", user_access_url, response.status)
                 if response.status != 200:
                     raise UpdateFailed(f"user-access returned {response.status}")
 
@@ -243,7 +277,7 @@ class BLifePackagesCoordinator(DataUpdateCoordinator[BLifePackagesData]):
                 else:
                     self._api_url = f"https://api-{raw_url}"
 
-                _LOGGER.debug("api_url: %s", self._api_url)
+                _LOGGER.info("Resolved api_url: %s", self._api_url)
 
     async def _enrich_pending_packages(
         self,
@@ -257,9 +291,14 @@ class BLifePackagesCoordinator(DataUpdateCoordinator[BLifePackagesData]):
                 continue
             try:
                 detail_url = f"{self._api_url}/mobile/v1/delivery/{package.package_id}"
+                _LOGGER.info("Fetching delivery detail for package %s", package.package_id)
                 async with session.get(detail_url, headers=headers) as resp:
+                    _LOGGER.info(
+                        "Delivery detail fetch for package %s responded with status %d",
+                        package.package_id,
+                        resp.status,
+                    )
                     if resp.status != 200:
-                        _LOGGER.debug("Detail fetch returned %s for package %s", resp.status, package.package_id)
                         continue
                     detail = (await resp.json(content_type=None)).get("value") or {}
                     package.access_code = detail.get("accessCode")
@@ -272,7 +311,7 @@ class BLifePackagesCoordinator(DataUpdateCoordinator[BLifePackagesData]):
                         elif cid == "40306110-2b9c-4b30-8d25-7243b293096d" or "tracking" in field_name.lower():
                             package.tracking_number = str(val) if val is not None else None
             except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("Failed to enrich package %s: %s", package.package_id, err)
+                _LOGGER.info("Failed to enrich package %s: %s", package.package_id, err)
 
     def _parse_packages_response(self, data: dict[str, Any]) -> BLifePackagesData:
         """Parse GraphQL response into BLifePackagesData."""

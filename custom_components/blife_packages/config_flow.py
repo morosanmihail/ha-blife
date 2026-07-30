@@ -46,13 +46,16 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
         "password": data[CONF_PASSWORD],
     }
 
+    login_url = f"{AUTH_BASE_URL}{AUTH_LOGIN_PATH}"
     try:
         async with aiohttp.ClientSession() as session:
+            _LOGGER.info("Authenticating against %s", login_url)
             async with session.post(
-                f"{AUTH_BASE_URL}{AUTH_LOGIN_PATH}",
+                login_url,
                 headers=headers,
                 json=login_data,
             ) as response:
+                _LOGGER.info("Authentication call to %s responded with status %d", login_url, response.status)
                 if response.status == 401:
                     raise InvalidAuth
 
@@ -84,6 +87,7 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
                     raise CannotConnect
 
                 firstname = data[CONF_USERNAME].split("@")[0].split(".")[0].capitalize()
+                _LOGGER.info("Authentication succeeded, token type %s", token_type)
 
                 return {
                     "title": f"BLife - {firstname}",
