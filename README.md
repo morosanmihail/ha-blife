@@ -60,16 +60,6 @@ Each package in the list includes:
 | `created_date` | Arrival timestamp (ISO 8601) |
 | `collected_date` | Collection timestamp (ISO 8601, null if pending) |
 
-## Secrets – what not to commit
-
-- Credentials are entered in Home Assistant's UI and stored in HA config — never in this repo.
-- **Deploy script**: Do not hardcode your Home Assistant host or SSH user. Use environment variables:
-  - `export HA_HOST=192.168.0.117` (or `homeassistant.local`)
-  - `export HA_USER=root`
-  - `export HA_CONFIG_PATH=/config`
-  - Then run `./deploy.sh`
-- Optional: create a `deploy.local.sh` that sets these and run that instead; `deploy.local.sh` is gitignored.
-
 ## Example Automations
 
 ### Notify when new package arrives
@@ -119,21 +109,6 @@ automation:
 ## API
 
 Authenticates against `https://auth.spikeglobal.io`, then queries the building's Spike community API via GraphQL (`POST /query`). Locker details fetched via REST (`GET /mobile/v1/delivery/{id}`) for pending packages only.
-
-## File Structure
-
-```
-custom_components/blife_packages/
-├── __init__.py          # Integration setup
-├── config_flow.py       # Configuration UI flow
-├── const.py             # Constants
-├── coordinator.py       # Data update coordinator
-├── manifest.json        # Integration metadata
-├── sensor.py            # Sensor entities
-├── strings.json         # Translation strings
-└── translations/
-    └── en.json          # English translations
-```
 
 ## Requirements
 
